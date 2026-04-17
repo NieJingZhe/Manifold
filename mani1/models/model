@@ -1,0 +1,132 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch.nn import ModuleList, Sequential, ReLU, Linear
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import BatchNorm, GINConv, GPSConv
+
+from tqdm import tqdm
+
+from manifold import prob_low_dim
+#get inspired from GeminiMol 
+#https://github.com/Wang-Lin-boop/GeminiMol/blob/e993d2572cd0b3ee57811451db7db64c07af2ae7/geminimol/model/GeminiMol.py#L142
+class GeminiMLP(nn.Module):
+    def __init__(self, input_dim, output_dim,expand_ratio=5):
+        super().__init__()
+        hidden = input_dim * expand_ratio
+
+        self.net = nn.Sequential(
+            # 扩维
+            nn.Linear(input_dim, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.LeakyReLU(0.1),
+
+            # funnel 压缩
+            nn.Linear(hidden, 1024),
+            nn.BatchNorm1d(1024),
+            nn.LeakyReLU(0.1),
+
+            nn.Linear(1024, 1024),
+            nn.BatchNorm1d(1024),
+            nn.LeakyReLU(0.1),
+
+            nn.Linear(1024, output_dim),
+            
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Net(torch.nn.Module):
+    def __init__(self, args, deg=None, edge_attr_dim=0, data=None, input_dim=12):
+        super().__init__()
+        self.args = args
+        in_dim = int(input_dim)
+        hidden = int(self.args.emb_dim)
+        self.pairhead=PairwiseScoreHead(node_dim=hidden)
+        self.gramhead = GramScoreHead()
+        self.node_emb = Linear(in_dim, hidden)
+
+        self.convs = ModuleList()
+        self.batch_norms = ModuleList()
+        self.mlp = GeminiMLP(args.emb_dim,args.Zi)
+        heads = getattr(self.args, "n_heads", 4)
+
+        for _ in range(self.args.num_layers):
+            local_mp = torch.nn.Sequential(Linear(hidden, hidden), ReLU(), Linear(hidden, hidden))
+            
+            local = GINConv(local_mp)
+            gps = GPSConv(channels=hidden, conv=local, heads=heads, dropout=self.args.dropout)
+            self.convs.append(gps)
+            self.batch_norms.append(BatchNorm(hidden))
+
+        
+
+    def forward(self, x, edge_index, edge_attr, batch):
+        x = x.float()
+        if edge_attr is not None:
+            edge_attr = edge_attr.float()
+
+        x = self.node_emb(x)
+
+        for conv, bn in zip(self.convs, self.batch_norms):
+            h = conv(x, edge_index, batch=batch)
+            h = bn(h)
+            h = F.relu(h)
+            x = h + x
+            x = F.dropout(x, self.args.dropout)
+
+
+        gram = self.gramhead(x,batch = batch)
+        pair = self.pairhead(x,batch = batch)
+        x = self.mlp(x)
+        Phat = prob_low_dim(x)
+        return Phat,gram,pair
+
+
+class GramScoreHead(torch.nn.Module):
+    def forward(self, H, batch):
+        outputs = []
+        num_graphs = batch.max().item() + 1
+
+        for g in range(num_graphs):
+            idx = (batch == g)
+            h = H[idx]            # (n, d) 
+            G = h @ h.t()         # (n, n)
+            outputs.append(G)
+
+        return outputs
+class PairwiseScoreHead(torch.nn.Module):
+    def __init__(self, node_dim, hidden_dim=128):
+        super().__init__()
+        self.mlp = Sequential(
+            Linear(2 * node_dim, hidden_dim),
+            ReLU(),
+            Linear(hidden_dim, 1)
+        )
+
+    def forward(self, H, batch):
+        """
+        H: (N_total, d)  
+        batch: (N_total,) 
+        return: list of (n_i, n_i) pairwise score matrices
+        """
+        outputs = []
+        num_graphs = batch.max().item() + 1
+
+        for g in range(num_graphs):
+            idx = (batch == g)
+            h = H[idx]            # (n, d)
+            n = h.size(0)
+
+            hi = h.unsqueeze(1).expand(n, n, -1)
+            hj = h.unsqueeze(0).expand(n, n, -1)
+
+            pair = torch.cat([hi, hj], dim=-1)   # (n, n, 2d)
+            score = self.mlp(pair).squeeze(-1)   # (n, n)
+
+            outputs.append(score)
+
+        return outputs
